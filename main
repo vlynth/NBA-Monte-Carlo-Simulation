@@ -1,0 +1,242 @@
+from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import leaguedashteamstats
+from nba_api.stats.static import teams
+import matplotlib.pyplot as plt
+
+import pandas as pd
+import numpy as np
+import math
+import random
+import time
+from collections import Counter
+import requests
+import re
+
+#get teams and organize by conference
+nba_teams = teams.get_teams()  
+conference_map = {
+    #Eastern Conference
+    "Boston Celtics": "East",
+    "Brooklyn Nets": "East",
+    "New York Knicks": "East",
+    "Philadelphia 76ers": "East",
+    "Toronto Raptors": "East",
+    "Chicago Bulls": "East",
+    "Cleveland Cavaliers": "East",
+    "Detroit Pistons": "East",
+    "Indiana Pacers": "East",
+    "Milwaukee Bucks": "East",
+    "Atlanta Hawks": "East",
+    "Charlotte Hornets": "East",
+    "Miami Heat": "East",
+    "Orlando Magic": "East",
+    "Washington Wizards": "East",
+
+    # Western Conference
+    "Denver Nuggets": "West",
+    "Minnesota Timberwolves": "West",
+    "Oklahoma City Thunder": "West",
+    "Portland Trail Blazers": "West",
+    "Utah Jazz": "West",
+    "Golden State Warriors": "West",
+    "Los Angeles Clippers": "West",
+    "Los Angeles Lakers": "West",
+    "Phoenix Suns": "West",
+    "Sacramento Kings": "West",
+    "Dallas Mavericks": "West",
+    "Houston Rockets": "West",
+    "Memphis Grizzlies": "West",
+    "New Orleans Pelicans": "West",
+    "San Antonio Spurs": "West",
+}
+
+# Extract full names and IDs 
+team_names = [t["full_name"] for t in nba_teams]
+team_id = [t["id"] for t in nba_teams]
+
+east_teams = [t for t in team_names if conference_map[t] == "East"]
+west_teams = [t for t in team_names if conference_map[t] == "West"]
+
+#Extract statistics
+time.sleep(0.6)   #
+stats = leaguedashteamstats.LeagueDashTeamStats(
+    measure_type_detailed_defense="Advanced",   # THIS gives eFG, TOV, ORB, FT Rate
+    season="2024-25",                           # adjust season
+    season_type_all_star="Regular Season"       # or "Playoffs"
+).get_data_frames()[0]
+
+#print("[DEBUG] leaguedashteamstats columns:", list(stats.columns))
+
+# fetches games and returns with rate limiting, returns empty df instead of throwing
+def safe_league_gamefinder(team_id_val: int, season: str = "2024-25", season_type: str = "Playoffs", max_retries: int = 3, wait: float = 1.0) -> pd.DataFrame:
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            # be gentle with the NBA API (helps avoid 403/429/timeout)
+            time.sleep(0.6)
+            gf = leaguegamefinder.LeagueGameFinder(
+                team_id_nullable=team_id_val,
+                season_nullable=season,
+                season_type_nullable=season_type,
+            )
+            df = gf.get_data_frames()[0]
+            if "PLUS_MINUS" in df.columns:
+                df["PLUS_MINUS"] = pd.to_numeric(df["PLUS_MINUS"], errors="coerce")
+            return df
+        except Exception as e:
+            last_exc = e
+            print(f"[WARN] Attempt {attempt} failed for team_id={team_id_val}: {e}")
+            time.sleep(wait * attempt)
+    print(f"[ERROR] Failed to fetch games for team_id={team_id_val}; returning empty DataFrame. Error: {last_exc}")
+    return pd.DataFrame(columns=["PLUS_MINUS"])  # safe empty
+
+team_games = {}
+for name, tid in zip(team_names, team_id):
+    games = safe_league_gamefinder(tid, season="2024-25", season_type="Playoffs")
+    team_games[name] = games
+
+team_fourfactors = {}
+
+#obtain vital statistics for each team
+for _, row in stats.iterrows():
+    team = row["TEAM_NAME"]
+    efg  = row["EFG_PCT"]
+    tov  = row["TM_TOV_PCT"]
+    orb  = row["OREB_PCT"]
+    ts  = row["TS_PCT"]
+
+    team_fourfactors[team] = {
+        "eFG": efg,
+        "TOV": tov,
+        "ORB": orb,
+        "TS": ts,
+    }
+
+#algorithm to compute rating
+def compute_team_rating(df: pd.DataFrame, factors) -> float:
+    if factors is None:
+        pm = float(df["PLUS_MINUS"].mean()) if "PLUS_MINUS" in df.columns and not df["PLUS_MINUS"].dropna().empty else 0.0
+        return pm
+    strength = 0.4 * factors["eFG"] + 0.25 * (1 - factors["TOV"]) + 0.2 * factors["ORB"] + 0.15 * factors["TS"] # lower TOV is bette 
+    if "PLUS_MINUS" in df.columns and not df["PLUS_MINUS"].dropna().empty:
+        return 0.6 * float(df["PLUS_MINUS"].mean()) + 0.4 * strength
+    return 0.0  
+
+ratings = {name: compute_team_rating(df,team_fourfactors.get(name)) for name, df in team_games.items()}
+
+# Scale and home-court
+all_margins = []
+for df in team_games.values():
+    if "PLUS_MINUS" in df.columns:
+        all_margins.extend(pd.to_numeric(df["PLUS_MINUS"], errors="coerce").dropna().tolist())
+
+s = float(np.std(all_margins, ddof=1)) if len(all_margins) > 0 else 10.0
+s = max(6.0, min(s, 14.0))  # keep within a sensible band
+HCA_POINTS = 2.7
+
+
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+#win probability based on ratings
+def win_prob(home_team: str, away_team: str) -> float:
+    x = (ratings[home_team] - ratings[away_team] + HCA_POINTS) / s
+    return sigmoid(x)
+
+
+# Best-of-7 series with 2-2-1-1-1 home pattern 
+HOME_PATTERN = [1, 1, 0, 0, 1, 0, 1]  
+
+def choose_home_team(team_a: str, team_b: str) -> str:
+    ra, rb = ratings[team_a], ratings[team_b]
+    if abs(ra - rb) < 1e-9:
+        return random.choice([team_a, team_b])
+    return team_a if ra > rb else team_b
+
+#Simulate series of 7 games
+def simulate_series(team_a: str, team_b: str, verbose: bool = True) -> str:
+    home_holder = choose_home_team(team_a, team_b)
+    away_side   = team_b if home_holder == team_a else team_a
+
+    wins = {team_a: 0, team_b: 0}
+    for g, host_home_holder in enumerate(HOME_PATTERN, start=1):
+        # Decide which team is home
+        if host_home_holder == 1:
+            home, away = home_holder, away_side
+        else:
+            home, away = away_side, home_holder
+
+        p_home = win_prob(home, away)
+        # Draw game outcome
+        if random.random() < p_home:
+            wins[home] += 1
+            winner = home
+        else:
+            wins[away] += 1
+            winner = away
+
+        if verbose:
+            print(f"Game {g}: {home} (home) vs {away} → {winner}; series {wins[team_a]}–{wins[team_b]}")
+
+        # Stop early if someone reaches 4 wins
+        if wins[team_a] == 4 or wins[team_b] == 4:
+            break
+
+    return team_a if wins[team_a] > wins[team_b] else team_b
+
+#creates tournament bracket
+def bracket_create(nba_teams):
+    matchups = []
+    for i in range(0, len(nba_teams), 2):
+        a = nba_teams[i]
+        b = nba_teams[i + 1]
+        matchups.append((a, b))
+    return matchups
+    
+
+
+#  Monte Carlo simulation
+random.seed(42)
+N = 10000
+champ_counts = {name: 0 for name in team_names}
+
+
+for _ in range(N):
+    # pick random playoff field 
+    east_sample = random.sample(east_teams, 4)
+    west_sample = random.sample(west_teams, 4)
+
+    random.shuffle(east_sample)
+    random.shuffle(west_sample)
+
+    # Eastern Conference
+    eastpre = bracket_create(east_sample)
+    eastpost = [simulate_series(a, b, verbose=False) for a, b in eastpre]
+    eastfinal = simulate_series(eastpost[0], eastpost[1], verbose=False)
+
+    # Western Conference
+    westpre = bracket_create(west_sample)
+    westpost = [simulate_series(a, b, verbose=False) for a, b in westpre]
+    westfinal = simulate_series(westpost[0], westpost[1], verbose=False)
+
+    # Finals
+    champion = simulate_series(eastfinal, westfinal, verbose=False)
+    champ_counts[champion] += 1
+
+print("\n Chances of Winning")
+for name, count in champ_counts.items():
+    pct = 100 * count / N
+    print(f"{name:20s}: {pct:5.2f}%")
+
+teams = list(champ_counts.keys())
+probs = [champ_counts[t] / N * 100 for t in teams]
+
+plt.figure(figsize=(12, 7))
+plt.xticks(np.arange(0,12,0.5))
+plt.barh(teams, probs)
+plt.xlabel("Chances of Winning Playoffs")
+plt.ylabel("Team Name")
+plt.title("NBA Playoff Monte Carlo Simulation")
+plt.gca().invert_yaxis()   # optional: highest at top
+plt.tight_layout()
+plt.show()
