@@ -60,19 +60,16 @@ west_teams = [t for t in team_names if conference_map[t] == "West"]
 #Extract statistics
 time.sleep(0.6)   #
 stats = leaguedashteamstats.LeagueDashTeamStats(
-    measure_type_detailed_defense="Advanced",   # THIS gives eFG, TOV, ORB, FT Rate
-    season="2024-25",                           # adjust season
-    season_type_all_star="Regular Season"       # or "Playoffs"
+    measure_type_detailed_defense="Advanced",   
+    season="2024-25",                          
+    season_type_all_star="Regular Season"      
 ).get_data_frames()[0]
-
-#print("[DEBUG] leaguedashteamstats columns:", list(stats.columns))
 
 # fetches games and returns with rate limiting, returns empty df instead of throwing
 def safe_league_gamefinder(team_id_val: int, season: str = "2024-25", season_type: str = "Playoffs", max_retries: int = 3, wait: float = 1.0) -> pd.DataFrame:
     last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            # be gentle with the NBA API (helps avoid 403/429/timeout)
             time.sleep(0.6)
             gf = leaguegamefinder.LeagueGameFinder(
                 team_id_nullable=team_id_val,
@@ -88,7 +85,7 @@ def safe_league_gamefinder(team_id_val: int, season: str = "2024-25", season_typ
             print(f"[WARN] Attempt {attempt} failed for team_id={team_id_val}: {e}")
             time.sleep(wait * attempt)
     print(f"[ERROR] Failed to fetch games for team_id={team_id_val}; returning empty DataFrame. Error: {last_exc}")
-    return pd.DataFrame(columns=["PLUS_MINUS"])  # safe empty
+    return pd.DataFrame(columns=["PLUS_MINUS"])  
 
 team_games = {}
 for name, tid in zip(team_names, team_id):
@@ -131,7 +128,7 @@ for df in team_games.values():
         all_margins.extend(pd.to_numeric(df["PLUS_MINUS"], errors="coerce").dropna().tolist())
 
 s = float(np.std(all_margins, ddof=1)) if len(all_margins) > 0 else 10.0
-s = max(6.0, min(s, 14.0))  # keep within a sensible band
+s = max(6.0, min(s, 14.0))  
 HCA_POINTS = 2.7
 
 
@@ -143,8 +140,6 @@ def win_prob(home_team: str, away_team: str) -> float:
     x = (ratings[home_team] - ratings[away_team] + HCA_POINTS) / s
     return sigmoid(x)
 
-
-# Best-of-7 series with 2-2-1-1-1 home pattern 
 HOME_PATTERN = [1, 1, 0, 0, 1, 0, 1]  
 
 def choose_home_team(team_a: str, team_b: str) -> str:
@@ -153,7 +148,7 @@ def choose_home_team(team_a: str, team_b: str) -> str:
         return random.choice([team_a, team_b])
     return team_a if ra > rb else team_b
 
-#Simulate series of 7 games
+#simulate series of 7 games
 def simulate_series(team_a: str, team_b: str, verbose: bool = True) -> str:
     home_holder = choose_home_team(team_a, team_b)
     away_side   = team_b if home_holder == team_a else team_a
@@ -178,7 +173,7 @@ def simulate_series(team_a: str, team_b: str, verbose: bool = True) -> str:
         if verbose:
             print(f"Game {g}: {home} (home) vs {away} → {winner}; series {wins[team_a]}–{wins[team_b]}")
 
-        # Stop early if someone reaches 4 wins
+        # Stop if a team reaches 4 wins
         if wins[team_a] == 4 or wins[team_b] == 4:
             break
 
@@ -231,12 +226,13 @@ for name, count in champ_counts.items():
 teams = list(champ_counts.keys())
 probs = [champ_counts[t] / N * 100 for t in teams]
 
+#plotting
 plt.figure(figsize=(12, 7))
 plt.xticks(np.arange(0,12,0.5))
 plt.barh(teams, probs)
 plt.xlabel("Chances of Winning Playoffs")
 plt.ylabel("Team Name")
 plt.title("NBA Playoff Monte Carlo Simulation")
-plt.gca().invert_yaxis()   # optional: highest at top
+plt.gca().invert_yaxis()   
 plt.tight_layout()
 plt.show()
